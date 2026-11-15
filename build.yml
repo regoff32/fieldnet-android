@@ -1,0 +1,45 @@
+name: Build FieldNet APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build the APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Rename APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk FieldNet.apk
+
+      - name: Save APK on the Actions run page
+        uses: actions/upload-artifact@v4
+        with:
+          name: FieldNet-apk
+          path: FieldNet.apk
+
+      - name: Put APK on the Releases page (easy phone download)
+        if: github.ref_name == github.event.repository.default_branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest FieldNet.apk \
+            --title "FieldNet for Android - latest build" \
+            --notes "Built from commit ${GITHUB_SHA::7}. Tap FieldNet.apk below to download."
