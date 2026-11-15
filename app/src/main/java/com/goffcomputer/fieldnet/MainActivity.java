@@ -69,7 +69,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class MainActivity extends Activity {
 
-    static final String VERSION = "1.0";
+    static final String VERSION = "1.1";
     static final String CHANNEL = "static_ip";
     static final int NOTIF_ID = 1;
 
@@ -132,7 +132,40 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        ui.removeCallbacks(rebindLoop);
+        ui.post(rebindLoop);
         refreshHeader();   // user may be coming back from Ethernet settings
+    }
+
+    @Override
+    protected void onPause() {
+        ui.removeCallbacks(rebindLoop);
+        super.onPause();
+    }
+
+    /** Every 3 seconds, if Ethernet is up but the app isn't locked onto it
+     *  (usually a VPN in the way), try again. Turning the VPN off is then
+     *  enough; no need to close the app or replug the cable. */
+    final Runnable rebindLoop = new Runnable() {
+        @Override
+        public void run() {
+            ensureBound();
+            ui.postDelayed(this, 3000);
+        }
+    };
+
+    /** Try to lock this app's traffic onto Ethernet. Returns true if locked. */
+    boolean ensureBound() {
+        Network n = eth;
+        if (n == null) return false;
+        if (bound && n.equals(cm.getBoundNetworkForProcess())) return true;
+        boolean was = bound;
+        bound = cm.bindProcessToNetwork(n);
+        if (bound != was) {
+            log("App traffic bound to Ethernet: " + bound);
+            refreshHeader();
+        }
+        return bound;
     }
 
     @Override
@@ -171,7 +204,10 @@ public class MainActivity extends Activity {
         banner.setTextColor(Color.WHITE);
         banner.setPadding(dp(10), dp(8), dp(10), dp(8));
         banner.setVisibility(View.GONE);
-        banner.setOnClickListener(v -> openEthernetSettings());
+        banner.setOnClickListener(v -> {
+            if (eth != null && !bound && vpnOn()) openVpnSettings();
+            else openEthernetSettings();
+        });
         root.addView(banner);
 
         LinearLayout ipRow = new LinearLayout(this);
@@ -271,6 +307,7 @@ public class MainActivity extends Activity {
 
     // ============================================================ task runner
     void start(Runnable r) {
+        ensureBound();
         if (busy) {
             toast("Still working. Tap STOP first.");
             return;
@@ -337,8 +374,9 @@ public class MainActivity extends Activity {
             @Override
             public void onAvailable(Network n) {
                 eth = n;
-                bound = cm.bindProcessToNetwork(n);
-                log("Ethernet connected, app traffic bound to it: " + bound);
+                bound = false;
+                log("Ethernet connected");
+                ensureBound();
                 refreshHeader();
             }
 
@@ -424,17 +462,30 @@ public class MainActivity extends Activity {
             String mode = e.ip == null ? "waiting for an IP"
                     : (e.dhcpServer != null ? "DHCP" : "STATIC");
             ethLine.setText("Ethernet: " + (e.ip != null ? e.cidr : "no IP yet") + "   (" + mode + ")"
-                    + (bound ? "" : "   [app NOT bound to Ethernet]"));
-            if (looksStatic(e)) {
+                    + (bound ? "" : "   [NOT locked onto Ethernet]"));
+            boolean isStatic = looksStatic(e);
+            if (isStatic) {
                 prefs.edit().putBoolean("wasStatic", true).apply();
-                showBanner("PHONE ETHERNET IS ON STATIC IP (" + e.cidr + "). "
-                        + "Switch it back to DHCP when the job is done. Tap here for Ethernet settings.",
-                        RED);
                 staticNotification(true, e.cidr);
             } else if (e.dhcpServer != null) {
                 prefs.edit().putBoolean("wasStatic", false).apply();
-                banner.setVisibility(View.GONE);
                 staticNotification(false, null);
+            }
+            if (!bound) {
+                String msg = vpnOn()
+                        ? "A VPN IS BLOCKING FIELDNET. Pause or turn off the VPN (tap here). "
+                          + "FieldNet locks onto Ethernet by itself within a few seconds."
+                        : "FIELDNET COULDN'T LOCK ONTO ETHERNET. Turn on Airplane mode "
+                          + "(Ethernet keeps working). It retries by itself.";
+                if (isStatic) msg += "\nAlso: phone Ethernet is on STATIC IP (" + e.cidr
+                        + "). Switch back to DHCP when done.";
+                showBanner(msg, isStatic ? RED : ORANGE);
+            } else if (isStatic) {
+                showBanner("PHONE ETHERNET IS ON STATIC IP (" + e.cidr + "). "
+                        + "Switch it back to DHCP when the job is done. Tap here for Ethernet settings.",
+                        RED);
+            } else {
+                banner.setVisibility(View.GONE);
             }
         });
     }
@@ -475,7 +526,35 @@ public class MainActivity extends Activity {
         } catch (Exception ignored) { }   // notifications turned off
     }
 
+    void openVpnSettings() {
+        toast("Pause or turn off the VPN, then come back");
+        try {
+            startActivity(new Intent(Settings.ACTION_VPN_SETTINGS));
+        } catch (Exception e) {
+            openEthernetSettings();
+        }
+    }
+
+    /** Try to open Samsung's Ethernet page directly. Android has no official
+     *  shortcut for it, so try the known ones and fall back to Connections. */
     void openEthernetSettings() {
+        Intent[] tries = {
+                new Intent("android.settings.ETHERNET_SETTINGS"),
+                new Intent().setClassName("com.android.settings",
+                        "com.android.settings.Settings$EthernetSettingsActivity"),
+                new Intent().setClassName("com.android.settings",
+                        "com.samsung.android.settings.ethernet.EthernetSettingsActivity"),
+                new Intent().setClassName("com.android.settings",
+                        "com.android.settings.Settings$MoreConnectionsSettingsActivity"),
+        };
+        for (int k = 0; k < tries.length; k++) {
+            try {
+                startActivity(tries[k]);
+                log("Opened settings with shortcut " + (k + 1));
+                if (k == 3) toast("Tap Ethernet");
+                return;
+            } catch (Exception ignored) { }
+        }
         toast("Go to: More connection settings > Ethernet");
         try {
             startActivity(new Intent(Settings.ACTION_WIRELESS_SETTINGS));
@@ -546,6 +625,7 @@ public class MainActivity extends Activity {
     // ================================================================ actions
     void doStatus() {
         hdr("Status");
+        ensureBound();
         EthInfo e = ethInfo();
         if (e == null) {
             needEth();
@@ -569,6 +649,7 @@ public class MainActivity extends Activity {
                 }
             }
             if (bound) ok("This app's traffic is forced onto Ethernet.");
+            else if (vpnOn()) err("A VPN is blocking FieldNet. Pause the VPN; it retries by itself.");
             else err("Couldn't force this app onto Ethernet. Try Airplane mode.");
         }
         say("", 0);
