@@ -69,7 +69,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class MainActivity extends Activity {
 
-    static final String VERSION = "1.1";
+    static final String VERSION = "1.2";
     static final String CHANNEL = "static_ip";
     static final int NOTIF_ID = 1;
 
@@ -234,6 +234,8 @@ public class MainActivity extends Activity {
                 btn("Check ports", v -> withIp(ip -> start(() -> doPorts(ip)))));
         addRow(root, btn("Open web page", v -> withIp(this::askWebPage)),
                 btn("Ethernet settings", v -> openEthernetSettings()));
+        addRow(root, btn("Listen for radios", v -> start(this::doListen)),
+                btn("Common defaults", v -> start(this::doDefaults)));
         addRow(root, btn("Share log", v -> shareLog()),
                 btn("Clear screen", v -> out.setText("", TextView.BufferType.EDITABLE)));
 
@@ -832,6 +834,282 @@ public class MainActivity extends Activity {
             err("No answer on any port. The device is off, on another subnet,");
             hint("or blocking everything. Try Find devices.");
         }
+    }
+
+    // ======================================================= v1.2: Listen
+    /** One thing heard on the cable. */
+    static class Heard {
+        final String ip, what;
+        final int rank;   // higher = more useful description
+        Heard(String ip, String what, int rank) { this.ip = ip; this.what = what; this.rank = rank; }
+    }
+
+    final java.util.concurrent.ConcurrentHashMap<String, Heard> heard =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    volatile String firstRadioIp;
+
+    void record(String ip, String what, int rank) {
+        if (ip == null || ip.equals("0.0.0.0")) return;
+        Heard old = heard.get(ip);
+        if (old != null && old.rank >= rank) return;
+        heard.put(ip, new Heard(ip, what, rank));
+        say("  heard " + ip + "   " + what, GREEN);
+        if (rank >= 2 && firstRadioIp == null) {
+            firstRadioIp = ip;
+            ui.post(() -> devIp.setText(ip));
+        }
+    }
+
+    static String u16str(byte[] b, int off, int len) {
+        return new String(b, off, len, java.nio.charset.StandardCharsets.UTF_8).trim();
+    }
+
+    static String ip4(byte[] b, int off) {
+        return (b[off] & 255) + "." + (b[off + 1] & 255) + "." + (b[off + 2] & 255) + "." + (b[off + 3] & 255);
+    }
+
+    /** MikroTik Neighbor Discovery packet (UDP 5678). */
+    void parseMndp(byte[] b, int len, String src) {
+        if (len <= 4) return;                       // our own 4-byte refresh request
+        String ident = null, board = null, ver = null, ip = null;
+        int i = 4;
+        while (i + 4 <= len) {
+            int t = ((b[i] & 255) << 8) | (b[i + 1] & 255);
+            int l = ((b[i + 2] & 255) << 8) | (b[i + 3] & 255);
+            i += 4;
+            if (l < 0 || i + l > len) break;
+            if (t == 5) ident = u16str(b, i, l);
+            else if (t == 7) ver = u16str(b, i, l);
+            else if (t == 12) board = u16str(b, i, l);
+            else if (t == 17 && l == 4) ip = ip4(b, i);
+            i += l;
+        }
+        StringBuilder d = new StringBuilder("MikroTik");
+        if (board != null && !board.isEmpty()) d.append(" ").append(board);
+        if (ident != null && !ident.isEmpty()) d.append("  name: ").append(ident);
+        if (ver != null && !ver.isEmpty()) d.append("  RouterOS ").append(ver.split(" ")[0]);
+        record(ip != null ? ip : src, d.toString(), 3);
+        if (ip != null && !ip.equals(src) && !src.equals("0.0.0.0")) record(src, "MikroTik (sent from this IP)", 2);
+    }
+
+    /** Ubiquiti discovery reply (UDP 10001). */
+    void parseUbnt(byte[] b, int len, String src) {
+        if (len <= 4 || b[0] != 1) return;          // our own 4-byte request
+        String host = null, model = null, fw = null, ssid = null;
+        List<String> ips = new ArrayList<>();
+        int i = 4;
+        while (i + 3 <= len) {
+            int t = b[i] & 255;
+            int l = ((b[i + 1] & 255) << 8) | (b[i + 2] & 255);
+            i += 3;
+            if (i + l > len) break;
+            if (t == 0x02 && l == 10) ips.add(ip4(b, i + 6));
+            else if (t == 0x0B) host = u16str(b, i, l);
+            else if (t == 0x14 || (t == 0x0C && model == null)) model = u16str(b, i, l);
+            else if (t == 0x03) fw = u16str(b, i, l);
+            else if (t == 0x0D) ssid = u16str(b, i, l);
+            i += l;
+        }
+        StringBuilder d = new StringBuilder("Ubiquiti");
+        if (model != null && !model.isEmpty()) d.append(" ").append(model);
+        if (host != null && !host.isEmpty()) d.append("  name: ").append(host);
+        if (ssid != null && !ssid.isEmpty()) d.append("  SSID: ").append(ssid);
+        if (fw != null && !fw.isEmpty()) d.append("  fw ").append(fw);
+        if (ips.isEmpty()) ips.add(src);
+        for (String ip : ips) record(ip, d.toString(), 3);
+    }
+
+    /** SSDP / UPnP announcement (UDP 1900): routers, cameras, NVRs, printers. */
+    void parseSsdp(byte[] b, int len, String src) {
+        String t = new String(b, 0, len, java.nio.charset.StandardCharsets.ISO_8859_1);
+        if (t.startsWith("M-SEARCH")) {
+            record(src, "something searching for UPnP devices", 1);
+            return;
+        }
+        String server = null;
+        for (String line : t.split("\r?\n")) {
+            String lo = line.toLowerCase(Locale.US);
+            if (lo.startsWith("server:")) server = line.substring(7).trim();
+        }
+        record(src, "UPnP device" + (server != null && !server.isEmpty() ? ": " + server : ""), 2);
+    }
+
+    interface PacketHandler { void handle(byte[] b, int len, String src); }
+
+    /** Receive on a socket until the deadline or STOP. */
+    Thread receiver(java.net.DatagramSocket s, long deadline, PacketHandler h) {
+        Thread t = new Thread(() -> {
+            byte[] buf = new byte[2048];
+            String me = myEthIp();
+            while (!stop && System.currentTimeMillis() < deadline) {
+                java.net.DatagramPacket p = new java.net.DatagramPacket(buf, buf.length);
+                try {
+                    s.receive(p);
+                } catch (java.net.SocketTimeoutException te) {
+                    continue;
+                } catch (Exception e) {
+                    break;
+                }
+                String src = p.getAddress() instanceof Inet4Address
+                        ? p.getAddress().getHostAddress() : "0.0.0.0";
+                if (src.equals(me)) continue;       // our own broadcast echoing back
+                try { h.handle(p.getData(), p.getLength(), src); } catch (Exception ignored) { }
+            }
+        });
+        t.start();
+        return t;
+    }
+
+    String myEthIp() {
+        EthInfo e = ethInfo();
+        return e != null && e.ip != null ? e.ip : "";
+    }
+
+    java.net.DatagramSocket udp(int port) throws Exception {
+        java.net.DatagramSocket s = new java.net.DatagramSocket(null);
+        s.setReuseAddress(true);
+        s.setBroadcast(true);
+        s.bind(new InetSocketAddress(port));
+        Network n = eth;
+        if (n != null) {
+            try { n.bindSocket(s); } catch (Exception ignored) { }
+        }
+        s.setSoTimeout(500);
+        return s;
+    }
+
+    void send(java.net.DatagramSocket s, byte[] data, String ip, int port) {
+        try {
+            s.send(new java.net.DatagramPacket(data, data.length, InetAddress.getByName(ip), port));
+        } catch (Exception ignored) { }
+    }
+
+    void doListen() {
+        hdr("Listen for radios (60 seconds - tap STOP to end early)");
+        if (!needEth()) return;
+        say("  Listening for MikroTik and Ubiquiti radios, and UPnP devices", 0);
+        say("  (routers, cameras, NVRs). Tip: power-cycle the radio now;", 0);
+        say("  they announce themselves while booting.", 0);
+        heard.clear();
+        firstRadioIp = null;
+        long deadline = System.currentTimeMillis() + 60_000;
+        List<java.net.DatagramSocket> socks = new ArrayList<>();
+        List<Thread> threads = new ArrayList<>();
+        java.net.DatagramSocket mndp = null, ubntListen = null, ubntAsk = null;
+        java.net.MulticastSocket ssdp = null;
+        try {
+            try {
+                mndp = udp(5678);
+                socks.add(mndp);
+                threads.add(receiver(mndp, deadline, this::parseMndp));
+            } catch (Exception e) { warn("Couldn't listen for MikroTik: " + e.getMessage()); }
+            try {
+                ubntListen = udp(10001);
+                socks.add(ubntListen);
+                threads.add(receiver(ubntListen, deadline, this::parseUbnt));
+            } catch (Exception e) { hint("(Ubiquiti announcements port busy; asking only.)"); }
+            try {
+                ubntAsk = udp(0);
+                socks.add(ubntAsk);
+                threads.add(receiver(ubntAsk, deadline, this::parseUbnt));
+            } catch (Exception e) { warn("Couldn't ask Ubiquiti radios: " + e.getMessage()); }
+            try {
+                ssdp = new java.net.MulticastSocket(null);
+                ssdp.setReuseAddress(true);
+                ssdp.bind(new InetSocketAddress(1900));
+                EthInfo e = ethInfo();
+                java.net.NetworkInterface ni = e != null && e.iface != null
+                        ? java.net.NetworkInterface.getByName(e.iface) : null;
+                InetSocketAddress grp = new InetSocketAddress(InetAddress.getByName("239.255.255.250"), 1900);
+                if (ni != null) ssdp.joinGroup(grp, ni);
+                else ssdp.joinGroup(InetAddress.getByName("239.255.255.250"));
+                ssdp.setSoTimeout(500);
+                socks.add(ssdp);
+                threads.add(receiver(ssdp, deadline, this::parseSsdp));
+            } catch (Exception e) { hint("(UPnP listening not available here.)"); }
+
+            byte[] mndpAsk = {0, 0, 0, 0};
+            byte[] ubntV1 = {1, 0, 0, 0};
+            byte[] ubntV2 = {2, 8, 0, 0};
+            byte[] msearch = ("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+                    + "MAN: \"ssdp:discover\"\r\nMX: 2\r\nST: ssdp:all\r\n\r\n")
+                    .getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+            int round = 0;
+            while (!stop && System.currentTimeMillis() < deadline) {
+                if (mndp != null) send(mndp, mndpAsk, "255.255.255.255", 5678);
+                if (ubntAsk != null) {
+                    send(ubntAsk, ubntV1, "255.255.255.255", 10001);
+                    send(ubntAsk, ubntV2, "255.255.255.255", 10001);
+                }
+                if (ssdp != null && round % 3 == 0) send(ssdp, msearch, "239.255.255.250", 1900);
+                round++;
+                for (int k = 0; k < 20 && !stop && System.currentTimeMillis() < deadline; k++) {
+                    Thread.sleep(250);
+                }
+                if (round % 4 == 0) {
+                    long left = (deadline - System.currentTimeMillis()) / 1000;
+                    if (left > 0) say("  ..." + left + " seconds left, " + heard.size() + " heard", GRAY);
+                }
+            }
+        } catch (InterruptedException ie) {
+            // stopping
+        } finally {
+            for (java.net.DatagramSocket s : socks) {
+                try { s.close(); } catch (Exception ignored) { }
+            }
+            for (Thread t : threads) {
+                try { t.join(1500); } catch (InterruptedException ignored) { }
+            }
+        }
+
+        say("", 0);
+        if (stop) warn("Stopped early.");
+        if (heard.isEmpty()) {
+            err("Nothing announced itself.");
+            hint("Power-cycle the radio while listening, and try again.");
+            hint("Other brands stay quiet. Tap Common defaults and try those subnets,");
+            hint("or use the laptop's FieldNet listen option, which hears everything.");
+            return;
+        }
+        ok(heard.size() + " heard:");
+        EthInfo e = ethInfo();
+        for (Heard h : new java.util.TreeMap<>(heard).values()) {
+            say("    " + h.ip + "   " + h.what, 0);
+        }
+        String pick = firstRadioIp;
+        if (pick == null) pick = heard.keySet().iterator().next();
+        say("", 0);
+        if (e != null && e.ip != null) {
+            int mask = e.prefix == 0 ? 0 : (int) (0xFFFFFFFFL << (32 - e.prefix));
+            if ((ipToInt(pick) & mask) == (ipToInt(e.ip) & mask)) {
+                ok(pick + " is on the phone's subnet. It's in Device IP now.");
+                hint("Try Ping x4, Check ports, or Open web page.");
+                return;
+            }
+        }
+        warn(pick + " is on a different subnet than the phone.");
+        hint("Tap Ethernet settings and set Static IP:");
+        hint("  IP address ...... " + suggestIp(pick));
+        hint("  Netmask ......... 255.255.255.0");
+        hint("  DNS ............. 8.8.8.8");
+        hint("  Gateway ......... " + pick);
+        hint("Type every box. Then come back and tap Ping x4.");
+    }
+
+    void doDefaults() {
+        hdr("Common default IPs");
+        say("  Ubiquiti airMAX / LTU ..... 192.168.1.20", 0);
+        say("  Mimosa .................... 192.168.1.20", 0);
+        say("  MikroTik .................. 192.168.88.1", 0);
+        say("  Cambium ePMP .............. 192.168.0.1", 0);
+        say("  Cambium PMP 450 ........... 169.254.1.1", 0);
+        say("  TP-Link CPE / Pharos ...... 192.168.0.254", 0);
+        say("  Most home routers ......... 192.168.1.1 or 192.168.0.1", 0);
+        say("  Some ISP gear ............. 10.0.0.1 or 192.168.100.1", 0);
+        say("", 0);
+        hint("To try one: put it in Device IP, set the phone to a static IP on");
+        hint("that subnet (Ethernet settings), then Ping x4 or Find devices.");
+        hint("Defaults are only true if nobody changed the radio's settings.");
     }
 
     void askWebPage(String ip) {
