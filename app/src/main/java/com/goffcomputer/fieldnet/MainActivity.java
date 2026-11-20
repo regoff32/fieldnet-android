@@ -66,10 +66,14 @@ import java.util.concurrent.atomic.AtomicInteger;
  * settings > Ethernet. This app forces its own traffic onto the Ethernet
  * adapter, checks the link, pings, finds devices, checks ports, opens a
  * device's web page, and nags while the phone is left on a static IP.
+ *
+ * v1.3: IPv6 check button (see Ipv6Check.java): is IPv6 on, does it work,
+ * is OpenDNS filtering bypassed over IPv6, router prefix/DNS, neighbors.
+ * v1.4: Space between the buttons so they don't run together.
  */
 public class MainActivity extends Activity {
 
-    static final String VERSION = "1.2";
+    static final String VERSION = "1.4";
     static final String CHANNEL = "static_ip";
     static final int NOTIF_ID = 1;
 
@@ -98,7 +102,7 @@ public class MainActivity extends Activity {
     volatile boolean busy;
     final Handler ui = new Handler(Looper.getMainLooper());
 
-    TextView out, banner, ethLine;
+    TextView out, banner, ethLine, v6Line;
     EditText devIp;
     ScrollView outScroll;
     SharedPreferences prefs;
@@ -198,6 +202,13 @@ public class MainActivity extends Activity {
         ethLine.setPadding(0, dp(2), 0, dp(4));
         root.addView(ethLine);
 
+        // IPv6 summary line, shown after an IPv6 check
+        v6Line = new TextView(this);
+        v6Line.setTextSize(13);
+        v6Line.setPadding(0, 0, 0, dp(4));
+        v6Line.setVisibility(View.GONE);
+        root.addView(v6Line);
+
         banner = new TextView(this);
         banner.setTextSize(14);
         banner.setTypeface(Typeface.DEFAULT_BOLD);
@@ -224,7 +235,10 @@ public class MainActivity extends Activity {
         devIp.setText(prefs.getString("lastIp", ""));
         ipRow.addView(devIp, new LinearLayout.LayoutParams(0,
                 LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        root.addView(ipRow);
+        LinearLayout.LayoutParams ipRowLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        ipRowLp.setMargins(0, 0, 0, dp(6));   // a little room above the first buttons
+        root.addView(ipRow, ipRowLp);
 
         addRow(root, btn("Status", v -> start(this::doStatus)),
                 btn("Ping x4", v -> withIp(ip -> start(() -> doPing(ip, false)))));
@@ -236,8 +250,9 @@ public class MainActivity extends Activity {
                 btn("Ethernet settings", v -> openEthernetSettings()));
         addRow(root, btn("Listen for radios", v -> start(this::doListen)),
                 btn("Common defaults", v -> start(this::doDefaults)));
-        addRow(root, btn("Share log", v -> shareLog()),
-                btn("Clear screen", v -> out.setText("", TextView.BufferType.EDITABLE)));
+        addRow(root, btn("IPv6 check", v -> start(() -> new Ipv6Check(this).run())),
+                btn("Share log", v -> shareLog()),
+                btn("Clear", v -> out.setText("", TextView.BufferType.EDITABLE)));
 
         outScroll = new ScrollView(this);
         out = new TextView(this);
@@ -247,8 +262,10 @@ public class MainActivity extends Activity {
         out.setPadding(0, dp(6), 0, dp(6));
         out.setText("", TextView.BufferType.EDITABLE);
         outScroll.addView(out);
-        root.addView(outScroll, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        LinearLayout.LayoutParams outLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f);
+        outLp.setMargins(0, dp(6), 0, 0);     // a little room below the last buttons
+        root.addView(outScroll, outLp);
 
         setContentView(root);
     }
@@ -261,16 +278,27 @@ public class MainActivity extends Activity {
         return b;
     }
 
-    void addRow(LinearLayout root, Button a, Button c) {
+    /** A row of equal-width buttons, with a gap around each one so they
+     *  don't run together (about 8 dp between neighbors). */
+    void addRow(LinearLayout root, Button... bs) {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0,
-                LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-        row.addView(a, lp);
-        LinearLayout.LayoutParams lp2 = new LinearLayout.LayoutParams(0,
-                LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-        row.addView(c, lp2);
+        for (Button b : bs) {
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0,
+                    LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+            lp.setMargins(dp(4), dp(4), dp(4), dp(4));
+            row.addView(b, lp);
+        }
         root.addView(row);
+    }
+
+    /** Show the IPv6 summary under the Ethernet line (thread-safe). */
+    void setV6Line(String text, int color) {
+        ui.post(() -> {
+            v6Line.setText(text);
+            v6Line.setTextColor(color != 0 ? color : GRAY);
+            v6Line.setVisibility(View.VISIBLE);
+        });
     }
 
     // ================================================================ output
@@ -650,6 +678,7 @@ public class MainActivity extends Activity {
                     warn("169.254.x.x means DHCP failed. Nothing gave the phone an address.");
                 }
             }
+            say("  IPv6 ............ " + Ipv6Check.quick(cm.getLinkProperties(eth)), 0);
             if (bound) ok("This app's traffic is forced onto Ethernet.");
             else if (vpnOn()) err("A VPN is blocking FieldNet. Pause the VPN; it retries by itself.");
             else err("Couldn't force this app onto Ethernet. Try Airplane mode.");
@@ -666,12 +695,14 @@ public class MainActivity extends Activity {
                     : nc.hasTransport(NetworkCapabilities.TRANSPORT_VPN) ? "VPN" : "Other";
             if (kind.equals("Ethernet")) continue;
             say("    " + kind + (lp != null && lp.getInterfaceName() != null
-                    ? " (" + lp.getInterfaceName() + ")" : ""), 0);
+                    ? " (" + lp.getInterfaceName() + ")" : "")
+                    + (kind.equals("VPN") ? "" : "   IPv6: " + Ipv6Check.quick(lp)), 0);
         }
         if (vpnOn()) {
             warn("A VPN is on. If devices don't answer, turn on \"Allow LAN");
             hint("connections\" in the VPN app, or pause the VPN for the job.");
         }
+        hint("Tap IPv6 check for the full IPv6 check.");
     }
 
     void doPing(String ip, boolean nonstop) {
