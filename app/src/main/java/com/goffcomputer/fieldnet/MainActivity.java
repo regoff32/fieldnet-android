@@ -70,10 +70,12 @@ import java.util.concurrent.atomic.AtomicInteger;
  * v1.3: IPv6 check button (see Ipv6Check.java): is IPv6 on, does it work,
  * is OpenDNS filtering bypassed over IPv6, router prefix/DNS, neighbors.
  * v1.4: Space between the buttons so they don't run together.
+ * 3.1: Renumbered. FieldNet for Android is now the only FieldNet; the
+ *      laptop versions are shelved. Hints no longer point to the laptop.
  */
 public class MainActivity extends Activity {
 
-    static final String VERSION = "1.4";
+    static final String VERSION = "3.1";
     static final String CHANNEL = "static_ip";
     static final int NOTIF_ID = 1;
 
@@ -1098,8 +1100,8 @@ public class MainActivity extends Activity {
         if (heard.isEmpty()) {
             err("Nothing announced itself.");
             hint("Power-cycle the radio while listening, and try again.");
-            hint("Other brands stay quiet. Tap Common defaults and try those subnets,");
-            hint("or use the laptop's FieldNet listen option, which hears everything.");
+            hint("Other brands stay quiet. Tap Common defaults and try those");
+            hint("subnets, or Find devices once the phone is on the right subnet.");
             return;
         }
         ok(heard.size() + " heard:");

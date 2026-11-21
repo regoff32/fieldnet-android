@@ -33,7 +33,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * FieldNet v1.3 - IPv6 check.
+ * FieldNet - IPv6 check (added in 1.3).
  *
  * Answers: Is IPv6 on? Does it work? Is DNS filtering (OpenDNS) being
  * bypassed? What's out there?
@@ -553,7 +553,7 @@ class Ipv6Check {
             if (!pingOk && !tableOk) {
                 neighLine = "Not available on this device";
                 a.say("  " + neighLine, 0);
-                a.hint("Use the laptop FieldNet IPv6 check for neighbors.");
+                a.hint("Android doesn't let apps see this here.");
             } else {
                 neighLine = count + " device(s) answered over IPv6";
                 a.say("  " + neighLine + ":", 0);
